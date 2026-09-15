@@ -11,6 +11,9 @@
 # Test binary, built with `go test -c`
 *.test
 
+# Extensionless binaries left by `go build ./...` in the repo root
+/connectivity
+
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
