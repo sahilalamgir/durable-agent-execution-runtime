@@ -68,7 +68,7 @@ Don't add a new dependency without a one-line reason in the commit/PR descriptio
 
 Placeholder — fill these in for real once Phase 0 exists, don't leave this stale:
 
-- `docker-compose up` — start Kafka, Redis, Postgres locally
+- `docker compose up` — start Kafka, Redis, Postgres locally
 - `go run ./scripts/connectivity` — run the Phase 0 Kafka/Redis connectivity check
 - `go run ./cmd/worker` — run a single worker
 - `go run ./cmd/controlplane` — run the control plane
