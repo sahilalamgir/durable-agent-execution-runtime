@@ -27,13 +27,13 @@ Companion to `durable-agent-runtime-spec.md`. That file is the _what_. This file
 **Create the folder structure:**
 
 ```
-.claude/specs/           → phase specs (phase-2-event-journal.md, phase-3-idempotency.md, etc.)
+.claude/specs/           → phase specs (phase2-event-journal.md, phase3-idempotency.md, etc.)
 .claude/agents/          → the subagents above
 .claude/skills/          → go-conventions
 docs/decisions/          → YOUR decisions log, one file per phase, in your own words
 ```
 
-`docs/decisions/` is deliberately separate from Claude's auto-generated `MEMORY.md`. MEMORY.md is Claude's operational memory of your codebase ("this project uses INR not USD" — implementation trivia). `docs/decisions/phase-N.md` is _your_ memory, written for a future interview: what the tradeoff was, what you chose, why, and what broke when you got it wrong the first time. Nobody else will write this for you, and it's the actual artifact that turns "I built a thing" into "I can explain a thing."
+`docs/decisions/` is deliberately separate from Claude's auto-generated `MEMORY.md`. MEMORY.md is Claude's operational memory of your codebase ("this project uses INR not USD" — implementation trivia). `docs/decisions/phaseN.md` is _your_ memory, written for a future interview: what the tradeoff was, what you chose, why, and what broke when you got it wrong the first time. Nobody else will write this for you, and it's the actual artifact that turns "I built a thing" into "I can explain a thing."
 
 **Optional custom slash command:** `.claude/commands/verify-ac.md` — takes a phase number as `$ARGUMENTS`, reads that phase's acceptance criteria from the system spec, and walks through each one asking you to confirm pass/fail with evidence (a log line, a metric, a screenshot) rather than just saying "looks good." This turns your self-verification requirement into something repeatable instead of something you have to remember to do rigorously every time.
 
@@ -41,8 +41,8 @@ docs/decisions/          → YOUR decisions log, one file per phase, in your own
 
 ## The loop (repeat this at every phase)
 
-1. **Sync and branch.** `git checkout main && git pull`, then `git checkout -b phase-N-<name>`.
-2. **Spec, if this phase needs one (2, 3, 4, 6, 8).** Use the `project-spec-writer` skill again, scoped tight to just this phase, with the system spec as background context you paste in or reference. Save it to `.claude/specs/phase-N-<name>.md`. Review it yourself before moving on — this is the step that's genuinely yours, not Claude Code's; the point of a spec you write/review by hand is that you can't skip understanding the phase and still produce it.
+1. **Sync and branch.** `git checkout main && git pull`, then `git checkout -b phaseN-<name>`.
+2. **Spec, if this phase needs one (2, 3, 4, 6, 8).** Use the `spec-writer` skill again, scoped tight to just this phase, with the system spec as background context you paste in or reference. Save it to `.claude/specs/phaseN-<name>.md`. Review it yourself before moving on — this is the step that's genuinely yours, not Claude Code's; the point of a spec you write/review by hand is that you can't skip understanding the phase and still produce it.
 3. **Concept tutoring pass — explicitly no code yet.** Open a Claude Code session and ask it to explain, in plain terms with your project's specifics as the example, whatever this phase introduces that you haven't used before (see the table below). Ask it to walk through at least one concrete failure scenario for the new concept, not just the happy-path definition. Do not let it write code in this step — if it starts generating a file, stop it. You're building the mental model that lets you review step 7 for real, not rubber-stamp it.
 4. **Plan mode.** `/plan` (or shift+tab), pointed at the phase spec. For phases 2, 3, 4, and 6 specifically, use **high or max effort** — these are the phases where the plan quality genuinely changes the outcome, not just the code style. Consider `/ultraplan` for Phase 3 specifically, since idempotency-under-crash is the single hardest piece of the whole project and a bad plan there is expensive to unwind later.
 5. **Push back on the plan before approving it.** At minimum ask: what happens if this fails halfway, what's the alternative approach you didn't pick and why, what's the concurrency-unsafe version of this that looks correct at first glance. If you can't personally restate the plan's core mechanism back in your own words, you're not ready to approve it — go back to step 3.
@@ -50,7 +50,7 @@ docs/decisions/          → YOUR decisions log, one file per phase, in your own
 7. **Manual diff review.** Read every line touching concurrency, fencing, or replay logic yourself, in full, before it merges — this is the one step your original principles explicitly forbid delegating. Boilerplate (Kafka client setup, generated protobuf code, YAML structure) you can skim.
 8. **Adversarial review.** Run `adversarial-reviewer` against the diff, fresh context, no access to the implementation conversation. Treat every flag seriously even if it seems pedantic — a concurrency bug that "probably won't happen" is exactly the bug your chaos test in Phase 8 exists to find the hard way instead.
 9. **Acceptance test, run by you, against real infra.** Not "Claude says the tests pass" — you personally run the phase's acceptance criteria from the system spec (or `/verify-ac N` if you built the slash command) and confirm each one with real evidence: a log line, a Grafana panel, a counter value. This is where phases 2, 3, and 8 in particular need you watching real output, not a summary.
-10. **Update your docs.** Add anything you corrected twice to the `go-conventions` skill. Add any new critical rule to `CLAUDE.md`. Write `docs/decisions/phase-N.md` yourself — what the hard decision was, what you picked, what you'd tell an interviewer about the alternative you rejected.
+10. **Update your docs.** Add anything you corrected twice to the `go-conventions` skill. Add any new critical rule to `CLAUDE.md`. Write `docs/decisions/phaseN.md` yourself — what the hard decision was, what you picked, what you'd tell an interviewer about the alternative you rejected.
 11. **Ship it.** `git add -A && git commit`, push, open and merge the PR, delete the branch, `git checkout main && git pull`.
 
 ---
