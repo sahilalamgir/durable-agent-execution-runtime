@@ -70,7 +70,7 @@ Placeholder — fill these in for real once Phase 0 exists, don't leave this sta
 
 - `docker compose up` — start Kafka, Redis, Postgres locally
 - `go run ./scripts/connectivity` — run the Phase 0 Kafka/Redis connectivity check
-- `go run ./cmd/worker` — run a single worker
+- `ANTHROPIC_API_KEY=... go run ./cmd/worker` — run a single worker; Phase 1 hardcodes a fake repo-maintenance task and runs it to completion in memory (no Kafka, no durability yet)
 - `go run ./cmd/controlplane` — run the control plane
 - `go test ./...` — run all tests
 
@@ -98,7 +98,7 @@ Update this table as phases complete — it's how a fresh Claude Code session kn
 | Phase | Description                        | Status      |
 | ----- | ---------------------------------- | ----------- |
 | 0     | Local environment (Docker Compose) | Not started |
-| 1     | Agent loop, no durability          | Not started |
+| 1     | Agent loop, no durability          | In review   |
 | 2     | Event journal (Kafka + Postgres)   | Not started |
 | 3     | Idempotent tool execution (Redis)  | Not started |
 | 4     | Kafka worker pool + approval flow  | Not started |
