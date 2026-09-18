@@ -19,6 +19,13 @@ type Tool interface {
 	Description() string
 	InputSchema() anthropic.ToolInputSchemaParam
 	Execute(ctx context.Context, rawArgs json.RawMessage) (result string, err error)
+	// HasSideEffect reports whether a real invocation of this tool has a
+	// real-world side effect (e.g. opening a PR) as opposed to only reading
+	// state (e.g. cloning a repo, running tests). Phase 3's Redis fencing
+	// only guards side-effecting tools; Phase 2 journals this flag on every
+	// ToolInvoked event so it is available to Phase 3 without a schema
+	// change.
+	HasSideEffect() bool
 }
 
 // Registry looks up tools by name and builds the tool definitions sent to

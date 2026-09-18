@@ -13,6 +13,9 @@
 
 # Extensionless binaries left by `go build ./...` in the repo root
 /connectivity
+/worker
+/projector
+/replay
 
 # Code coverage profiles and other test artifacts
 *.out

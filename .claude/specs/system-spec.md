@@ -140,6 +140,8 @@ service RunControlPlane {
 
 _Partitioning by `run_id` on every topic is what guarantees a single run's events/commands are always processed in order and never split across workers mid-run._
 
+`run-events` topic config (decided in Phase 2, load-bearing for replay — don't change without updating this spec): 6 partitions, replication factor 1, `cleanup.policy=delete`, `retention.ms=-1` (infinite retention — this topic is the source of truth, not a transient queue, so it must never expire data via the default 7-day retention).
+
 **`run-commands` message:**
 
 ```json
@@ -162,7 +164,7 @@ _Partitioning by `run_id` on every topic is what guarantees a single run's event
   "sequence_number": "int — monotonic per run_id, starts at 0",
   "event_type": "enum: RunStarted | LLMResponded | ToolInvoked | ToolResulted | AwaitingApproval | RunApproved | RunCompleted | RunFailed | RunCancelled",
   "payload": "object — shape depends on event_type, see below",
-  "occurred_at": "timestamp — assigned by the worker, never the client",
+  "occurred_at": "timestamp — assigned by the worker, never the client; UTC, truncated to microsecond precision so it round-trips unchanged through Postgres's TIMESTAMPTZ",
   "idempotency_key": "string | null — present only on ToolInvoked events with side effects"
 }
 ```
@@ -170,9 +172,9 @@ _Partitioning by `run_id` on every topic is what guarantees a single run's event
 Per-`event_type` payload shapes:
 
 - `RunStarted`: `{ workload_type, input, max_steps }`
-- `LLMResponded`: `{ step, chosen_tool, tool_args, is_terminal }`
-- `ToolInvoked`: `{ step, tool_name, tool_args, idempotency_key, has_side_effect }`
-- `ToolResulted`: `{ step, tool_name, result, status: "success"|"error", was_replayed_from_cache }`
+- `LLMResponded`: `{ step, stop_reason, content, is_terminal }` — _amended in Phase 2: the original `{ chosen_tool, tool_args }` shape assumed one tool call per LLM response, but Anthropic's API allows a single response to contain several `tool_use` blocks in one turn. `content` is the response's content-block array, encoded verbatim as returned by the Messages API (text and tool_use blocks, including each tool_use's `id`), so replay can rebuild the exact assistant turn and match each later `tool_result` to the right `tool_use_id`._
+- `ToolInvoked`: `{ step, tool_use_id, tool_name, tool_args, idempotency_key, has_side_effect }` — _amended in Phase 2 to add `tool_use_id`, needed to match this invocation back to the specific `tool_use` block in `LLMResponded.content` (a single step's response can request more than one tool)._
+- `ToolResulted`: `{ step, tool_use_id, tool_name, result, status: "success"|"error", was_replayed_from_cache }` — _amended in Phase 2 to add `tool_use_id`, for the same reason as `ToolInvoked`._
 - `AwaitingApproval`: `{ step, reason, approval_payload }`
 - `RunApproved`: `{ step, approved_by, decision, notes }`
 - `RunCompleted`: `{ final_output, total_steps }`
@@ -229,6 +231,8 @@ CREATE TABLE runs (
 | `budget:{tenant_id}:{hour_bucket}`              | Token budget enforcement           | Atomic check-and-increment via Lua script                                |
 
 _Assumption: idempotency key TTL defaults to 24h (must exceed the longest plausible run duration, including time spent `AWAITING_APPROVAL`). This should be a configurable constant, not hardcoded, since approval waits could legitimately exceed 24h._
+
+_Flagged during Phase 2 (unresolved, Phase 3 must decide before implementing fencing): `run_id:step:sha256(tool_name+args)` collides when a single step's `LLMResponded` requests the same tool with identical args twice in one turn (two identical `tool_use` blocks) — both would hash to the same key even though they're distinct invocations with distinct `tool_use_id`s. Phase 3's spec should decide whether to fold `tool_use_id` (or a block index) into the key._
 
 ## Constraints
 

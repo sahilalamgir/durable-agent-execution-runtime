@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/anthropics/anthropic-sdk-go"
 )
@@ -25,6 +26,10 @@ func NewRunTestsTool() *RunTestsTool {
 
 func (t *RunTestsTool) Name() string { return "run_tests" }
 
+// HasSideEffect reports false: running the test suite has no real-world
+// side effect worth fencing against duplication.
+func (t *RunTestsTool) HasSideEffect() bool { return false }
+
 func (t *RunTestsTool) Description() string {
 	return "Runs the repository's test suite and reports pass/fail results."
 }
@@ -36,6 +41,9 @@ func (t *RunTestsTool) InputSchema() anthropic.ToolInputSchemaParam {
 }
 
 func (t *RunTestsTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := mockToolDelay(ctx); err != nil {
+		return "", fmt.Errorf("waiting out mock delay: %w", err)
+	}
 	t.calls++
 	if t.calls == 1 {
 		return "2 tests failed: TestParseWidget, TestWidgetTotal", nil
