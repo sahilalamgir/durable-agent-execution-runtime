@@ -19,6 +19,10 @@ func NewApplyFixTool() *ApplyFixTool {
 
 func (t *ApplyFixTool) Name() string { return "apply_fix" }
 
+// HasSideEffect reports true: applying a fix mutates the repository's
+// working tree and must be fenced against duplication (Phase 3).
+func (t *ApplyFixTool) HasSideEffect() bool { return true }
+
 func (t *ApplyFixTool) Description() string {
 	return "Applies a fix to the repository's code."
 }
@@ -40,6 +44,9 @@ type applyFixArgs struct {
 }
 
 func (t *ApplyFixTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := mockToolDelay(ctx); err != nil {
+		return "", fmt.Errorf("waiting out mock delay: %w", err)
+	}
 	var args applyFixArgs
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return "", fmt.Errorf("unmarshaling apply_fix args: %w", err)

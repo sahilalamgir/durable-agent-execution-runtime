@@ -19,6 +19,10 @@ func NewCloneRepoTool() *CloneRepoTool {
 
 func (t *CloneRepoTool) Name() string { return "clone_repo" }
 
+// HasSideEffect reports false: cloning a repo into the local workspace has
+// no real-world side effect worth fencing against duplication.
+func (t *CloneRepoTool) HasSideEffect() bool { return false }
+
 func (t *CloneRepoTool) Description() string {
 	return "Clones a git repository into the local workspace."
 }
@@ -40,6 +44,9 @@ type cloneRepoArgs struct {
 }
 
 func (t *CloneRepoTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := mockToolDelay(ctx); err != nil {
+		return "", fmt.Errorf("waiting out mock delay: %w", err)
+	}
 	var args cloneRepoArgs
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return "", fmt.Errorf("unmarshaling clone_repo args: %w", err)

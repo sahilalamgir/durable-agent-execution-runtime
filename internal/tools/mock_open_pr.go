@@ -18,6 +18,11 @@ func NewOpenPRTool() *OpenPRTool {
 
 func (t *OpenPRTool) Name() string { return "open_pr" }
 
+// HasSideEffect reports true: opening a pull request is exactly the
+// real-world side effect this project exists to guard against duplicating
+// (Phase 3).
+func (t *OpenPRTool) HasSideEffect() bool { return true }
+
 func (t *OpenPRTool) Description() string {
 	return "Opens a pull request with the given title and body."
 }
@@ -44,6 +49,9 @@ type openPRArgs struct {
 }
 
 func (t *OpenPRTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if err := mockToolDelay(ctx); err != nil {
+		return "", fmt.Errorf("waiting out mock delay: %w", err)
+	}
 	var args openPRArgs
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
 		return "", fmt.Errorf("unmarshaling open_pr args: %w", err)

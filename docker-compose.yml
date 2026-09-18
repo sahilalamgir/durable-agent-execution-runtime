@@ -1,7 +1,21 @@
 services:
+  # One-shot init: the apache/kafka image runs Kafka as uid 1000 ("appuser"),
+  # but a freshly-created named volume is owned by root, so Kafka can't
+  # write into it until ownership is fixed once, up front. This container
+  # does that and exits; kafka waits for it to succeed before starting.
+  kafka-data-init:
+    image: busybox
+    command: chown -R 1000:1000 /tmp/kafka-logs /tmp/kraft-combined-logs
+    volumes:
+      - kafka-data:/tmp/kafka-logs
+      - kafka-metadata:/tmp/kraft-combined-logs
+
   kafka:
     image: apache/kafka:3.7.0
     container_name: dae-kafka
+    depends_on:
+      kafka-data-init:
+        condition: service_completed_successfully
     ports:
       - "9092:9092"
     environment:
@@ -15,6 +29,20 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+    volumes:
+      # The previous guess here (/tmp/kraft-combined-logs) was wrong in
+      # practice: that path only ever held the KRaft controller/metadata
+      # log, which was empty even after real topic traffic. This container's
+      # server.properties never sets log.dirs explicitly (no KAFKA_LOG_DIRS
+      # env var is set above), so Kafka falls back to its long-standing
+      # built-in default, /tmp/kafka-logs — confirmed by finding
+      # run-events-0..5's actual segment directories there directly inside
+      # a running container (`find / -iname 'run-events-*'`). That's the
+      # path that actually needs to survive `docker compose down`/`up` for
+      # FR-28/AC-20 to hold; mounting the (harmless, empty) metadata path
+      # too costs nothing and covers the metadata log if this ever changes.
+      - kafka-data:/tmp/kafka-logs
+      - kafka-metadata:/tmp/kraft-combined-logs
     healthcheck:
       test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
       interval: 5s
@@ -27,6 +55,8 @@ services:
     container_name: dae-redis
     ports:
       - "6379:6379"
+    # Intentionally no volume: Phase 2 doesn't use Redis yet, and Phase 3
+    # will hold disposable fencing/lease state here, not durable history.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -42,8 +72,17 @@ services:
       POSTGRES_USER: dae
       POSTGRES_PASSWORD: dae
       POSTGRES_DB: dae
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "dae", "-d", "dae"]
       interval: 5s
       timeout: 3s
       retries: 10
+
+# FR-28: named volumes so events/the projection survive `docker compose down`
+# / `up`. `docker compose down -v` remains the full reset.
+volumes:
+  kafka-data:
+  kafka-metadata:
+  postgres-data:

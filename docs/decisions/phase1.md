@@ -19,3 +19,5 @@
 - Solution: Comment made (not fixed) that a fresh Registry should be built for every task. This is fine for now as phase 1 will not have multiple agent runs, this is a future phase's porblem, but good to catch and document right now. Would be overengineering to fix that problem right now.
 
 8. Added Truncated flag when an LLM's output hits the max token limit (stop_reason=max_tokens) so caller can tell difference between finished and unfinished response
+
+9. Known gap for Phase 2, found while planning event-sourcing: system-spec.md's LLMResponded event ({ step, chosen_tool, tool_args, is_terminal }) assumes one tool call per step, but Phase 1's loop proved a single LLM response can request multiple tools at once (see #5). The event schema also doesn't capture each tool_use block's own id from Anthropic's API, which replay needs to unambiguously match a ToolResulted event back to the specific call it answers when a step had more than one. Not fixed in Phase 1 (no events exist yet) - deliberately left for whoever specs Phase 2 to amend system-spec.md before implementing, per CLAUDE.md's "spec first" rule.

@@ -8,26 +8,31 @@ Full contracts, schemas, and edge cases live in `.claude/specs/system-spec.md`. 
 
 ## Architecture
 
-No code exists yet, so this is a proposed layout for Phase 0/1. Update this section once real code exists and the layout has proven itself — don't let it silently go stale.
+Phases 0–2 are real code now; everything else below is still a proposed layout. Update this section again once each later phase lands and its part of the layout has proven itself — don't let it silently go stale.
 
 ```
 /cmd
-  /worker            → worker process entrypoint (consumes run-commands, executes agent loop)
-  /controlplane      → gRPC control-plane server entrypoint
+  /worker            → worker process entrypoint: runs the journaled agent loop to completion (Phase 2); consumes run-commands starting Phase 4
+  /projector         → consumes run-events and is the ONLY writer to Postgres (Phase 2)
+  /controlplane      → gRPC control-plane server entrypoint (Phase 5, proposed)
 /internal
-  /agent             → the LLM-call → tool-decision loop itself
-  /events            → event envelope + per-type payload structs, (de)serialization
-  /idempotency       → Redis fencing/claim logic (Phase 3+)
-  /kafka             → producer/consumer wrappers, topic name constants
-  /store             → Postgres access — the projector is the ONLY writer here (see Critical Rules)
-  /grpcserver        → generated protobuf code + control-plane service implementation
+  /agent             → the LLM-call → tool-decision loop, journaling every step through internal/kafka before acting on it (Phase 2)
+  /events            → event envelope + per-type payload structs, (de)serialization (Phase 2)
+  /kafka             → producer wrapper, topic name constants, partitioning (Phase 2)
+  /replay            → the pure fold (RunState, Apply/Fold, Messages/Digest) + Kafka/Postgres EventSource implementations (Phase 2)
+  /store             → Postgres access — cmd/projector is the ONLY writer here (see Critical Rules); internal/store.EventReader is a read-only cross-check source (Phase 2)
   /tools             → tool implementations (mocked early, real repo-maintenance tools in Phase 9)
-  /metrics           → Prometheus instrumentation
-/proto               → .proto source files
+  /idempotency       → Redis fencing/claim logic (Phase 3+, proposed)
+  /grpcserver        → generated protobuf code + control-plane service implementation (Phase 5, proposed)
+  /metrics           → Prometheus instrumentation (Phase 7, proposed)
+/proto               → .proto source files (Phase 5, proposed)
 /deploy
-  /docker            → Dockerfiles
-  /k8s               → K8s manifests, KEDA ScaledObject (Phase 6+)
-/scripts             → chaos test harness, local dev helper scripts
+  /docker            → Dockerfiles (Phase 6+, proposed)
+  /k8s               → K8s manifests, KEDA ScaledObject (Phase 6+, proposed)
+/scripts
+  /connectivity      → Phase 0 Kafka/Redis connectivity check
+  /replay            → FR-21 CLI: reconstructs and prints a run's state from Kafka or Postgres (Phase 2)
+  → chaos test harness lands here in Phase 8 (proposed)
 .claude/specs/       → system spec + phase specs
 docs/decisions/      → phase-by-phase decision log (human-written, not Claude Code's job)
 ```
@@ -66,13 +71,14 @@ Don't add a new dependency without a one-line reason in the commit/PR descriptio
 
 ## Commands
 
-Placeholder — fill these in for real once Phase 0 exists, don't leave this stale:
-
-- `docker compose up` — start Kafka, Redis, Postgres locally
+- `docker compose up` — start Kafka, Redis, Postgres locally (named volumes keep Kafka's log and Postgres's data across `down`/`up`; `docker compose down -v` is the full reset)
 - `go run ./scripts/connectivity` — run the Phase 0 Kafka/Redis connectivity check
-- `ANTHROPIC_API_KEY=... go run ./cmd/worker` — run a single worker; Phase 1 hardcodes a fake repo-maintenance task and runs it to completion in memory (no Kafka, no durability yet)
-- `go run ./cmd/controlplane` — run the control plane
-- `go test ./...` — run all tests
+- `ANTHROPIC_API_KEY=... go run ./cmd/worker` — run a single worker; it journals every step to `run-events` before acting on it (Phase 2), generates and prints its own `run_id`, and runs the hardcoded fake repo-maintenance task to completion. Env: `DAE_KAFKA_BROKERS` (default `localhost:9092`), `DAE_MOCK_TOOL_DELAY`, `DAE_CRASH_AFTER_SEQ` (crash-testing only)
+- `go run ./cmd/projector` — the only process that writes to Postgres; consumes `run-events` as consumer group `projector` and keeps `events`/`runs` current. Env: `DAE_KAFKA_BROKERS`, `DAE_POSTGRES_DSN` (default `postgres://dae:dae@localhost:5432/dae?sslmode=disable`), `DAE_PROJECTOR_CRASH_BEFORE_OFFSET_COMMIT` (crash-testing only)
+- `go run ./scripts/replay --run-id <uuid> --source kafka` — reconstruct and print a run's state from its events (`--source postgres` for cross-checking only; Kafka is always authoritative, D-2)
+- `go run ./cmd/controlplane` — run the control plane (Phase 5, not built yet)
+- `go test ./...` — run all unit tests (no infrastructure required); `go test -tags=integration ./...` additionally runs the Kafka/Postgres integration tests, which need `docker compose up`
+- `go list -deps ./cmd/worker | grep jackc/pgx` — must print nothing (AC-8/FR-26): this is a manual/CI check, not a Go test, since a build-time dependency graph isn't something `go test` can assert on directly
 
 ## Learning Goals & Process
 
@@ -96,10 +102,10 @@ This project exists so I (Sahil) genuinely learn distributed systems, concurrenc
 Update this table as phases complete — it's how a fresh Claude Code session knows what already exists vs. what's still planned, without you re-explaining it every time.
 
 | Phase | Description                        | Status      |
-| ----- | ---------------------------------- | ----------- |
-| 0     | Local environment (Docker Compose) | Not started |
-| 1     | Agent loop, no durability          | In review   |
-| 2     | Event journal (Kafka + Postgres)   | Not started |
+| ----- | ----------------------------------- | ----------- |
+| 0     | Local environment (Docker Compose)  | Done        |
+| 1     | Agent loop, no durability          | Done        |
+| 2     | Event journal (Kafka + Postgres)   | In progress |
 | 3     | Idempotent tool execution (Redis)  | Not started |
 | 4     | Kafka worker pool + approval flow  | Not started |
 | 5     | gRPC control plane                 | Not started |
