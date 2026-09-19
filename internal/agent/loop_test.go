@@ -12,7 +12,6 @@ import (
 
 	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/events"
 	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/replay"
-	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/tools"
 )
 
 // stubLLMClient replays a scripted list of responses, one per
@@ -75,14 +74,7 @@ func maxTokensFixture(msgID, text string) string {
 		msgID, text)
 }
 
-func newTestRegistry() *tools.Registry {
-	return tools.NewRegistry(
-		tools.NewCloneRepoTool(),
-		tools.NewRunTestsTool(),
-		tools.NewApplyFixTool(),
-		tools.NewOpenPRTool(),
-	)
-}
+const testModel = anthropic.ModelClaudeSonnet5
 
 // newTestJournal builds a JournalConfig backed by a fresh fakePublisher, so
 // each test gets its own isolated publish history.
@@ -101,18 +93,6 @@ func mustMessagesJSON(t *testing.T, msgs []anthropic.MessageParam) string {
 		t.Fatalf("marshaling messages: %v", err)
 	}
 	return string(b)
-}
-
-// countingTool wraps a tools.Tool to count Execute calls, without adding
-// any test-only instrumentation to the production mocks themselves.
-type countingTool struct {
-	tools.Tool
-	calls int
-}
-
-func (t *countingTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
-	t.calls++
-	return t.Tool.Execute(ctx, rawArgs)
 }
 
 func TestLoopRun(t *testing.T) {
@@ -217,7 +197,8 @@ func TestLoopRun(t *testing.T) {
 			stub := &stubLLMClient{responses: responses}
 
 			journal, pub := newTestJournal("run-" + tt.name)
-			loop := NewLoop(stub, newTestRegistry(), anthropic.ModelClaudeSonnet5, 1024, tt.maxSteps, io.Discard, journal)
+			loop := newFenceFixture(t).newLoop(stub, journal)
+			loop.maxSteps = tt.maxSteps
 
 			outcome, err := loop.Run(context.Background(), Task{Prompt: "do the thing"})
 			if err != nil {
@@ -276,7 +257,7 @@ func TestLoopRunTruncated(t *testing.T) {
 		mustMessage(t, maxTokensFixture("msg_1", "cut off mid-sente")),
 	}}
 	journal, pub := newTestJournal("run-truncated")
-	loop := NewLoop(stub, newTestRegistry(), anthropic.ModelClaudeSonnet5, 1024, 10, io.Discard, journal)
+	loop := newFenceFixture(t).newLoop(stub, journal)
 
 	outcome, err := loop.Run(context.Background(), Task{Prompt: "do the thing"})
 	if err != nil {
@@ -322,7 +303,7 @@ func TestNewLoopPanicsOnInvalidMaxSteps(t *testing.T) {
 				}
 			}()
 			journal, _ := newTestJournal("run-invalid-maxsteps")
-			NewLoop(&stubLLMClient{}, newTestRegistry(), anthropic.ModelClaudeSonnet5, 1024, maxSteps, io.Discard, journal)
+			NewLoop(&stubLLMClient{}, newFenceFixture(t).registry(), testModel, 1024, maxSteps, io.Discard, journal, nil)
 		})
 	}
 }
@@ -330,7 +311,7 @@ func TestNewLoopPanicsOnInvalidMaxSteps(t *testing.T) {
 func TestLoopRunLLMError(t *testing.T) {
 	stub := &stubLLMClient{} // no scripted responses: first call fails.
 	journal, pub := newTestJournal("run-llm-error")
-	loop := NewLoop(stub, newTestRegistry(), anthropic.ModelClaudeSonnet5, 1024, 10, io.Discard, journal)
+	loop := newFenceFixture(t).newLoop(stub, journal)
 
 	_, err := loop.Run(context.Background(), Task{Prompt: "do the thing"})
 	if err == nil {
@@ -382,7 +363,7 @@ func TestLiveReplayEquivalence(t *testing.T) {
 		},
 	}
 
-	loop := NewLoop(stub, newTestRegistry(), anthropic.ModelClaudeSonnet5, 1024, 10, io.Discard, journal)
+	loop := newFenceFixture(t).newLoop(stub, journal)
 	if _, err := loop.Run(context.Background(), Task{Prompt: "do the thing"}); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -416,20 +397,19 @@ func TestWriteAhead(t *testing.T) {
 		pub := &fakePublisher{failEventType: events.EventToolInvoked}
 		journal := NewJournalConfig(pub, "run-fail-toolinvoked", "local-dev", "repo-maintenance-agent")
 
-		cloneTool := &countingTool{Tool: tools.NewCloneRepoTool()}
-		reg := tools.NewRegistry(cloneTool, tools.NewRunTestsTool(), tools.NewApplyFixTool(), tools.NewOpenPRTool())
+		fx := newFenceFixture(t)
 
 		stub := &stubLLMClient{responses: []*anthropic.Message{
 			mustMessage(t, toolUseFixture("msg_1", "toolu_1", "clone_repo", `{"repo_url":"https://github.com/example/widgets.git"}`)),
 		}}
-		loop := NewLoop(stub, reg, anthropic.ModelClaudeSonnet5, 1024, 10, io.Discard, journal)
+		loop := fx.newLoop(stub, journal)
 
 		_, err := loop.Run(context.Background(), Task{Prompt: "do the thing"})
 		if !errors.Is(err, ErrPublishFailed) {
 			t.Fatalf("Run() error = %v, want errors.Is(_, ErrPublishFailed)", err)
 		}
-		if cloneTool.calls != 0 {
-			t.Fatalf("clone_repo Execute was called %d time(s), want 0", cloneTool.calls)
+		if fx.execs["clone_repo"] != 0 {
+			t.Fatalf("clone_repo Execute was called %d time(s), want 0", fx.execs["clone_repo"])
 		}
 		for _, e := range pub.snapshot() {
 			if e.EventType == events.EventToolResulted {
@@ -442,20 +422,19 @@ func TestWriteAhead(t *testing.T) {
 		pub := &fakePublisher{failEventType: events.EventLLMResponded}
 		journal := NewJournalConfig(pub, "run-fail-llmresponded", "local-dev", "repo-maintenance-agent")
 
-		cloneTool := &countingTool{Tool: tools.NewCloneRepoTool()}
-		reg := tools.NewRegistry(cloneTool, tools.NewRunTestsTool(), tools.NewApplyFixTool(), tools.NewOpenPRTool())
+		fx := newFenceFixture(t)
 
 		stub := &stubLLMClient{responses: []*anthropic.Message{
 			mustMessage(t, toolUseFixture("msg_1", "toolu_1", "clone_repo", `{"repo_url":"https://github.com/example/widgets.git"}`)),
 		}}
-		loop := NewLoop(stub, reg, anthropic.ModelClaudeSonnet5, 1024, 10, io.Discard, journal)
+		loop := fx.newLoop(stub, journal)
 
 		_, err := loop.Run(context.Background(), Task{Prompt: "do the thing"})
 		if !errors.Is(err, ErrPublishFailed) {
 			t.Fatalf("Run() error = %v, want errors.Is(_, ErrPublishFailed)", err)
 		}
-		if cloneTool.calls != 0 {
-			t.Fatalf("clone_repo Execute was called %d time(s), want 0", cloneTool.calls)
+		if fx.execs["clone_repo"] != 0 {
+			t.Fatalf("clone_repo Execute was called %d time(s), want 0", fx.execs["clone_repo"])
 		}
 		for _, e := range pub.snapshot() {
 			if e.EventType == events.EventToolInvoked {
@@ -471,7 +450,7 @@ func TestWriteAhead(t *testing.T) {
 		stub := &stubLLMClient{responses: []*anthropic.Message{
 			mustMessage(t, terminalFixture("msg_1", "done")),
 		}}
-		loop := NewLoop(stub, newTestRegistry(), anthropic.ModelClaudeSonnet5, 1024, 10, io.Discard, journal)
+		loop := newFenceFixture(t).newLoop(stub, journal)
 
 		if _, err := loop.Run(context.Background(), Task{Prompt: "do the thing"}); err != nil {
 			t.Fatalf("Run() error = %v", err)

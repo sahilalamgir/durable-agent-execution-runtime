@@ -136,7 +136,8 @@ func envOr(key, def string) string {
 //
 //	run_id=<uuid> source=kafka events=6
 //	status=RUNNING current_step=2 max_steps=10 next_sequence=6
-//	next_action=RESOLVE_IN_FLIGHT_TOOL in_flight=run_tests(toolu_02B)
+//	next_action=RESOLVE_IN_FLIGHT_TOOL in_flight=open_pr(toolu_05E) side_effect=true idem_key=idem:7f1c…:5:toolu_05E invoked_at=2026-09-20T14:02:11.104233Z
+//	tool_results: apply_fix(toolu_03C) status=success resolution=executed; open_pr(toolu_05E) status=success resolution=cached
 //	messages: user[text] assistant[text,tool_use] user[tool_result] assistant[tool_use]
 //	state_digest=4be1…9a0c
 //
@@ -145,6 +146,9 @@ func printState(w io.Writer, runID, source string, eventCount int, s replay.RunS
 	fmt.Fprintf(w, "run_id=%s source=%s events=%d\n", runID, source, eventCount)
 	fmt.Fprintf(w, "status=%s current_step=%d max_steps=%d next_sequence=%d\n", s.Status, s.CurrentStep, s.MaxSteps, s.NextSequence)
 	fmt.Fprintln(w, nextActionLine(s))
+	if line := toolResultsLine(s); line != "" {
+		fmt.Fprintln(w, line)
+	}
 
 	msgs, err := s.Messages()
 	if err != nil {
@@ -164,7 +168,13 @@ func nextActionLine(s replay.RunState) string {
 	line := fmt.Sprintf("next_action=%s", s.NextAction)
 	switch {
 	case s.InFlightTool != nil:
-		line += fmt.Sprintf(" in_flight=%s(%s)", s.InFlightTool.ToolName, s.InFlightTool.ToolUseID)
+		t := s.InFlightTool
+		key := "null"
+		if t.IdempotencyKey != nil {
+			key = *t.IdempotencyKey
+		}
+		line += fmt.Sprintf(" in_flight=%s(%s) side_effect=%t idem_key=%s invoked_at=%s",
+			t.ToolName, t.ToolUseID, t.HasSideEffect, key, t.InvokedAt.UTC().Format(time.RFC3339Nano))
 	case len(s.PendingToolCalls) > 0:
 		names := make([]string, len(s.PendingToolCalls))
 		for i, tc := range s.PendingToolCalls {
@@ -173,6 +183,20 @@ func nextActionLine(s replay.RunState) string {
 		line += fmt.Sprintf(" pending=%s", strings.Join(names, ","))
 	}
 	return line
+}
+
+// toolResultsLine summarizes every journaled ToolResulted, or returns "" if
+// there are none. resolution is empty for events journaled before Phase 3.
+func toolResultsLine(s replay.RunState) string {
+	results := s.ToolResults()
+	if len(results) == 0 {
+		return ""
+	}
+	parts := make([]string, len(results))
+	for i, r := range results {
+		parts[i] = fmt.Sprintf("%s(%s) status=%s resolution=%s", r.ToolName, r.ToolUseID, r.Status, r.Resolution)
+	}
+	return "tool_results: " + strings.Join(parts, "; ")
 }
 
 func summarizeMessages(msgs []anthropic.MessageParam) string {

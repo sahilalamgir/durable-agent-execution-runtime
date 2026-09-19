@@ -173,8 +173,9 @@ Per-`event_type` payload shapes:
 
 - `RunStarted`: `{ workload_type, input, max_steps }`
 - `LLMResponded`: `{ step, stop_reason, content, is_terminal }` — _amended in Phase 2: the original `{ chosen_tool, tool_args }` shape assumed one tool call per LLM response, but Anthropic's API allows a single response to contain several `tool_use` blocks in one turn. `content` is the response's content-block array, encoded verbatim as returned by the Messages API (text and tool_use blocks, including each tool_use's `id`), so replay can rebuild the exact assistant turn and match each later `tool_result` to the right `tool_use_id`._
-- `ToolInvoked`: `{ step, tool_use_id, tool_name, tool_args, idempotency_key, has_side_effect }` — _amended in Phase 2 to add `tool_use_id`, needed to match this invocation back to the specific `tool_use` block in `LLMResponded.content` (a single step's response can request more than one tool)._
-- `ToolResulted`: `{ step, tool_use_id, tool_name, result, status: "success"|"error", was_replayed_from_cache }` — _amended in Phase 2 to add `tool_use_id`, for the same reason as `ToolInvoked`._
+- `ToolInvoked`: `{ step, tool_use_id, tool_name, tool_args, idempotency_key, has_side_effect }` — _amended in Phase 2 to add `tool_use_id`, needed to match this invocation back to the specific `tool_use` block in `LLMResponded.content` (a single step's response can request more than one tool). Amended in Phase 3: `idempotency_key` is non-null iff `has_side_effect`, and equals the envelope's `idempotency_key`._
+- `ToolResulted`: `{ step, tool_use_id, tool_name, result, status: "success"|"error", was_replayed_from_cache, resolution }` — _amended in Phase 2 to add `tool_use_id`, for the same reason as `ToolInvoked`. Amended in Phase 3: adds `resolution: "executed" | "cached" | "reconciled" | "reexecuted"`; `was_replayed_from_cache == (resolution == "cached")`. Additive: Phase 2 events decode with `resolution: ""`._
+- `RunFailed.error_class` gains `unresolved_side_effect` and `idempotency_record_mismatch` (Phase 3).
 - `AwaitingApproval`: `{ step, reason, approval_payload }`
 - `RunApproved`: `{ step, approved_by, decision, notes }`
 - `RunCompleted`: `{ final_output, total_steps }`
@@ -226,13 +227,15 @@ CREATE TABLE runs (
 
 | Key pattern                                     | Purpose                            | Operation                                                                |
 | ----------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------ |
-| `idem:{run_id}:{step}:{sha256(tool_name+args)}` | Idempotency fencing                | `SET key value NX EX <ttl>`; value = JSON-encoded `ToolResulted` payload |
+| `idem:{run_id}:{step}:{tool_use_id}`            | Idempotency fencing                | claim = `SET key <IdemRecord> NX GET EX <ttl>`; resolve/takeover = compare-and-set Lua on `claim_token`; value = `IdemRecord` JSON (Phase 3 spec) |
 | `lease:{run_id}`                                | Worker ownership / crash detection | `SET key worker_id NX EX <lease_ttl>`, renewed by heartbeat              |
 | `budget:{tenant_id}:{hour_bucket}`              | Token budget enforcement           | Atomic check-and-increment via Lua script                                |
 
-_Assumption: idempotency key TTL defaults to 24h (must exceed the longest plausible run duration, including time spent `AWAITING_APPROVAL`). This should be a configurable constant, not hardcoded, since approval waits could legitimately exceed 24h._
+_Assumption: idempotency key TTL defaults to 24h (must exceed the longest plausible run duration, including time spent `AWAITING_APPROVAL`). Configurable via `DAE_IDEMPOTENCY_TTL`; must be `> tool_timeout + 30s` (checked at startup); the TTL is refreshed on resolve; an expired key is treated per Phase 3 FR-13 (absent is only proof of "never ran" if the in-flight `ToolInvoked` is younger than the TTL)._
 
-_Flagged during Phase 2 (unresolved, Phase 3 must decide before implementing fencing): `run_id:step:sha256(tool_name+args)` collides when a single step's `LLMResponded` requests the same tool with identical args twice in one turn (two identical `tool_use` blocks) — both would hash to the same key even though they're distinct invocations with distinct `tool_use_id`s. Phase 3's spec should decide whether to fold `tool_use_id` (or a block index) into the key._
+_Resolved in Phase 3: the old key `run_id:step:sha256(tool_name+args)` collided when one step's `LLMResponded` requested the same tool with identical args twice (two `tool_use` blocks, two distinct `tool_use_id`s). The key now uses `tool_use_id`, which is fixed once `LLMResponded` is journaled. The args hash moves into the record value and is verified on read (mismatch → `RunFailed{idempotency_record_mismatch}`), so a future canonicalization change is detected instead of silently duplicating (Phase 3 D-1)._
+
+_Redis must run with AOF `appendfsync always`, `maxmemory-policy noeviction`, and a persistent volume. Fencing correctness depends on it: an absent key is used as evidence that a tool never ran (Phase 3 D-8)._
 
 ## Constraints
 
@@ -243,7 +246,7 @@ _Flagged during Phase 2 (unresolved, Phase 3 must decide before implementing fen
 
 ## Edge Cases & Error Handling
 
-EC-1: Worker crashes _after_ a tool's real-world side effect fires but _before_ the `ToolResulted` event and idempotency key are durably written → On resume, the fencing key is absent, so the system cannot know the side effect already happened. This is the one gap idempotency alone can't close. _Mitigation to design for: write the idempotency key (as a "claimed" placeholder) immediately before invoking the tool, and only fill in the result after — so a crash mid-flight leaves a claimed-but-unresolved key that a recovering worker must explicitly reconcile (e.g., check the external system's state, or flag for manual review) rather than blindly retry._
+EC-1: Worker crashes _after_ a tool's real-world side effect fires but _before_ the `ToolResulted` event and idempotency key are durably written → On resume, the fencing key is absent, so the system cannot know the side effect already happened. This is the one gap idempotency alone can't close. _Concrete mitigation (Phase 3): claim → execute → resolve, a three-state record (absent → claimed → resolved), a per-tool `Reconciler` that asks the outside world "did this happen?" for a stale claim, and `RunFailed{unresolved_side_effect}` for tools with no reconciler (flag for manual review rather than blindly retry)._
 
 EC-2: Redis is unreachable when a worker checks the idempotency key before a side-effecting tool call → Fail **closed**: do not execute the tool; retry the check with backoff or fail the step as `retryable: true`. Failing open would defeat the entire purpose of the project.
 
@@ -259,7 +262,7 @@ EC-7: `CancelRun` is called while a worker is mid-tool-call → Cancellation is 
 
 EC-8: `GetRunStatus` is called with a `run_id` that never existed → Returns gRPC `NOT_FOUND`, not an empty/default status object.
 
-EC-9: The same tool is legitimately meant to run twice with different arguments in the same run (e.g., two different PRs in one run) vs. a true duplicate retry with identical arguments → Distinguished because the idempotency key includes `step` and `tool_args`, not just `tool_name` — different args at the same step, or the same args at a different step, produce different keys and are not treated as duplicates.
+EC-9: The same tool is legitimately meant to run twice with different arguments in the same run (e.g., two different PRs in one run) vs. a true duplicate retry with identical arguments → Distinguished because the idempotency key includes `tool_use_id` (amended in Phase 3): different invocations, even with identical args, get different ids and therefore different keys. A retry of one invocation re-reads the same id from the journal, so it gets the same key.
 
 EC-10: KEDA scales workers to zero during a lull, then a burst of `SubmitRun` calls arrives → Commands queue durably in `run-commands` (Kafka retains them) until KEDA observes the lag and scales pods up; no commands are dropped, but there's a cold-start latency window that should show up in the Grafana latency panel, not be hidden.
 

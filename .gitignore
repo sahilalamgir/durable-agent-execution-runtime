@@ -30,6 +30,9 @@ profile.cov
 go.work
 go.work.sum
 
+# Mock side-effect ledger (Phase 3)
+.dae/
+
 # env file
 .env
 

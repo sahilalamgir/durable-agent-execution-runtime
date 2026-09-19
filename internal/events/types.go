@@ -65,8 +65,8 @@ type LLMRespondedPayload struct {
 
 func (LLMRespondedPayload) EventType() EventType { return EventLLMResponded }
 
-// ToolInvokedPayload is EventToolInvoked's payload. IdempotencyKey is always
-// nil in Phase 2 (Phase 3 introduces real fencing keys).
+// ToolInvokedPayload is EventToolInvoked's payload. IdempotencyKey is
+// non-nil iff HasSideEffect, and equals the envelope's idempotency_key.
 type ToolInvokedPayload struct {
 	Step           int             `json:"step"`
 	ToolUseID      string          `json:"tool_use_id"`
@@ -78,8 +78,19 @@ type ToolInvokedPayload struct {
 
 func (ToolInvokedPayload) EventType() EventType { return EventToolInvoked }
 
+// ToolResulted resolution values (Phase 3 FR-18). Non-side-effect tools
+// always record ResolutionExecuted.
+const (
+	ResolutionExecuted   = "executed"
+	ResolutionCached     = "cached"
+	ResolutionReconciled = "reconciled"
+	ResolutionReexecuted = "reexecuted"
+)
+
 // ToolResultedPayload is EventToolResulted's payload. Status is "success" or
-// "error".
+// "error". Resolution says how the result was obtained; events journaled
+// before Phase 3 decode with Resolution "". WasReplayedFromCache is kept and
+// must equal Resolution == ResolutionCached.
 type ToolResultedPayload struct {
 	Step                 int    `json:"step"`
 	ToolUseID            string `json:"tool_use_id"`
@@ -87,6 +98,7 @@ type ToolResultedPayload struct {
 	Result               string `json:"result"`
 	Status               string `json:"status"`
 	WasReplayedFromCache bool   `json:"was_replayed_from_cache"`
+	Resolution           string `json:"resolution"`
 }
 
 func (ToolResultedPayload) EventType() EventType { return EventToolResulted }

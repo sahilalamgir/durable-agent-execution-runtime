@@ -55,8 +55,13 @@ services:
     container_name: dae-redis
     ports:
       - "6379:6379"
-    # Intentionally no volume: Phase 2 doesn't use Redis yet, and Phase 3
-    # will hold disposable fencing/lease state here, not durable history.
+    # Phase 3 (D-8): the idempotency fence treats an ABSENT key as proof a
+    # tool never ran, so Redis must not lose writes. AOF with fsync on every
+    # write, no eviction, and a named volume. This reverses the earlier
+    # "disposable fencing state" assumption.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -86,3 +91,4 @@ volumes:
   kafka-data:
   kafka-metadata:
   postgres-data:
+  redis-data:
