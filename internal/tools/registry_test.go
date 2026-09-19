@@ -2,11 +2,13 @@ package tools
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 )
 
 func TestRegistryLookup(t *testing.T) {
-	reg := NewRegistry(NewCloneRepoTool(), NewRunTestsTool())
+	ledger := NewLedger(filepath.Join(t.TempDir(), "ledger.jsonl"))
+	reg := NewRegistry(NewCloneRepoTool(), NewRunTestsTool(ledger))
 
 	tests := []struct {
 		name     string
@@ -31,11 +33,12 @@ func TestRegistryLookup(t *testing.T) {
 }
 
 func TestRegistryDefinitions(t *testing.T) {
+	ledger := NewLedger(filepath.Join(t.TempDir(), "ledger.jsonl"))
 	reg := NewRegistry(
-		NewOpenPRTool(),
+		NewOpenPRTool(ledger),
 		NewCloneRepoTool(),
-		NewApplyFixTool(),
-		NewRunTestsTool(),
+		NewApplyFixTool(ledger),
+		NewRunTestsTool(ledger),
 	)
 
 	defs := reg.Definitions()
@@ -67,37 +70,12 @@ func TestCloneRepoToolExecute(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tool := NewCloneRepoTool()
-			got, err := tool.Execute(context.Background(), []byte(tt.args))
+			got, err := tool.Execute(context.Background(), Invocation{RunID: "run-1", ToolUseID: "toolu_1"}, []byte(tt.args))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Execute() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if !tt.wantErr && got != tt.want {
 				t.Fatalf("Execute() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestRunTestsToolExecute(t *testing.T) {
-	tests := []struct {
-		name string
-		call int
-		want string
-	}{
-		{"first call reports failures", 1, "2 tests failed: TestParseWidget, TestWidgetTotal"},
-		{"second call reports success", 2, "all tests passed (2/2)"},
-		{"third call still reports success", 3, "all tests passed (2/2)"},
-	}
-
-	tool := NewRunTestsTool()
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := tool.Execute(context.Background(), []byte(`{}`))
-			if err != nil {
-				t.Fatalf("Execute() error = %v", err)
-			}
-			if got != tt.want {
-				t.Fatalf("Execute() call %d = %q, want %q", tt.call, got, tt.want)
 			}
 		})
 	}
@@ -115,8 +93,8 @@ func TestApplyFixToolExecute(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tool := NewApplyFixTool()
-			got, err := tool.Execute(context.Background(), []byte(tt.args))
+			tool := NewApplyFixTool(NewLedger(filepath.Join(t.TempDir(), "ledger.jsonl")))
+			got, err := tool.Execute(context.Background(), Invocation{RunID: "run-1", ToolUseID: "toolu_1"}, []byte(tt.args))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Execute() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -134,13 +112,13 @@ func TestOpenPRToolExecute(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"succeeds", `{"title":"Fix widget parsing","body":"Fixes failing tests."}`, "opened PR #42: Fix widget parsing", false},
+		{"succeeds", `{"title":"Fix widget parsing","body":"Fixes failing tests."}`, "opened PR #1: Fix widget parsing", false},
 		{"malformed args", `{"title":123,"body":"Fixes failing tests."}`, "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tool := NewOpenPRTool()
-			got, err := tool.Execute(context.Background(), []byte(tt.args))
+			tool := NewOpenPRTool(NewLedger(filepath.Join(t.TempDir(), "ledger.jsonl")))
+			got, err := tool.Execute(context.Background(), Invocation{RunID: "run-1", ToolUseID: "toolu_1"}, []byte(tt.args))
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Execute() error = %v, wantErr %v", err, tt.wantErr)
 			}

@@ -27,6 +27,10 @@ type fakePublisher struct {
 	// failEventType, if non-empty, makes every Publish call for that event
 	// type fail.
 	failEventType events.EventType
+
+	// rec, if set, receives "Publish(<EventType>)" for every acknowledged
+	// publish, so a test can check ordering against other fakes.
+	rec *recorder
 }
 
 func (f *fakePublisher) Publish(ctx context.Context, e events.Envelope) error {
@@ -42,6 +46,7 @@ func (f *fakePublisher) Publish(ctx context.Context, e events.Envelope) error {
 	if f.failEventType != "" && e.EventType == f.failEventType {
 		return fmt.Errorf("fakePublisher: forced failure for event type %s", e.EventType)
 	}
+	f.rec.add("Publish(" + string(e.EventType) + ")")
 	return nil
 }
 

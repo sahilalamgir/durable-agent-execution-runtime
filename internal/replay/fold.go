@@ -3,6 +3,7 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 
@@ -62,7 +63,7 @@ func Apply(s RunState, e events.Envelope) (RunState, error) {
 		next.RunID = e.RunID
 		next.TenantID = e.TenantID
 	}
-	if err := applyPayload(&next, payload); err != nil {
+	if err := applyPayload(&next, payload, e.OccurredAt); err != nil {
 		return s, wrapSeq(e.SequenceNumber, err)
 	}
 
@@ -116,14 +117,14 @@ func isTerminalStatus(status RunStatus) bool {
 
 // applyPayload applies payload's type-specific transition to next, which
 // must already have been cloned from the pre-event state.
-func applyPayload(next *RunState, payload events.Payload) error {
+func applyPayload(next *RunState, payload events.Payload, occurredAt time.Time) error {
 	switch p := payload.(type) {
 	case events.RunStartedPayload:
 		return applyRunStarted(next, p)
 	case events.LLMRespondedPayload:
 		return applyLLMResponded(next, p)
 	case events.ToolInvokedPayload:
-		return applyToolInvoked(next, p)
+		return applyToolInvoked(next, p, occurredAt)
 	case events.ToolResultedPayload:
 		return applyToolResulted(next, p)
 	case events.AwaitingApprovalPayload:
@@ -188,6 +189,8 @@ func applyLLMResponded(next *RunState, p events.LLMRespondedPayload) error {
 	step := stepRecord{
 		content:    content,
 		isTerminal: p.IsTerminal,
+		stopReason: p.StopReason,
+		invoked:    make(map[string]invocation),
 		results:    make(map[string]events.ToolResultedPayload),
 	}
 	for _, block := range content {
@@ -201,7 +204,7 @@ func applyLLMResponded(next *RunState, p events.LLMRespondedPayload) error {
 	return nil
 }
 
-func applyToolInvoked(next *RunState, p events.ToolInvokedPayload) error {
+func applyToolInvoked(next *RunState, p events.ToolInvokedPayload, occurredAt time.Time) error {
 	step, err := currentStepFor(next, p.ToolUseID)
 	if err != nil {
 		return err
@@ -210,6 +213,11 @@ func applyToolInvoked(next *RunState, p events.ToolInvokedPayload) error {
 		return ErrToolOrder // at most one ToolInvoked per tool_use_id.
 	}
 	step.invokedOrder = append(step.invokedOrder, p.ToolUseID)
+	step.invoked[p.ToolUseID] = invocation{
+		hasSideEffect:  p.HasSideEffect,
+		idempotencyKey: p.IdempotencyKey,
+		invokedAt:      occurredAt,
+	}
 	return nil
 }
 
@@ -284,6 +292,10 @@ func deriveToolState(next *RunState) {
 		if contains(last.invokedOrder, id) {
 			if next.InFlightTool == nil {
 				cp := tc
+				inv := last.invoked[id]
+				cp.HasSideEffect = inv.hasSideEffect
+				cp.IdempotencyKey = inv.idempotencyKey
+				cp.InvokedAt = inv.invokedAt
 				next.InFlightTool = &cp
 			}
 			continue
@@ -329,21 +341,24 @@ func computeNextAction(s RunState) NextAction {
 	if s.InFlightTool != nil {
 		return ActionResolveInFlightTool
 	}
+
+	last := s.steps[len(s.steps)-1]
+	if last.isTerminal {
+		// A terminal response (end_turn, max_tokens, ...) is never followed
+		// by tool execution, even if its content has tool_use blocks: a
+		// max_tokens response can end in a truncated tool_use whose args
+		// must not be run.
+		return ActionFinishRun
+	}
 	if len(s.PendingToolCalls) > 0 {
 		return ActionExecuteTool
 	}
-
-	last := s.steps[len(s.steps)-1]
 	if len(last.order) == 0 {
-		if last.isTerminal {
-			// The worker should emit a terminal event next; Status is
-			// still RUNNING until it does (see the truth table's footnote).
-			return ActionNone
-		}
-		// stop_reason == tool_use with zero tool_use blocks: FR-10 maps
-		// this straight to RunFailed. Replay should never observe it as a
-		// non-terminal state, but there is nothing to do if it did.
-		return ActionNone
+		// stop_reason=tool_use with zero tool_use blocks (malformed). Like a
+		// terminal response, the worker must emit a terminal event next;
+		// RunState.TerminalPayload says which. Status stays RUNNING until it
+		// does.
+		return ActionFinishRun
 	}
 
 	if s.CurrentStep < s.MaxSteps {

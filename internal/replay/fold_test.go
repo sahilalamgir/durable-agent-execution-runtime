@@ -139,7 +139,7 @@ func TestFoldCrashPoints(t *testing.T) {
 			wantStatus:       StatusRunning,
 			wantCurrentStep:  1,
 			wantNextSeq:      2,
-			wantNextAction:   ActionNone,
+			wantNextAction:   ActionFinishRun,
 			wantMessageShape: []string{"user:text", "assistant:text"},
 		},
 		{

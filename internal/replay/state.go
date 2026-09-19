@@ -36,7 +36,11 @@ const (
 	ActionExecuteTool         NextAction = "EXECUTE_TOOL"
 	ActionResolveInFlightTool NextAction = "RESOLVE_IN_FLIGHT_TOOL"
 	ActionFailMaxSteps        NextAction = "FAIL_MAX_STEPS"
-	ActionNone                NextAction = "NONE"
+	// ActionFinishRun means the last LLMResponded needs no more tool calls
+	// and the run's terminal event hasn't been written yet; see
+	// RunState.TerminalPayload.
+	ActionFinishRun NextAction = "FINISH_RUN"
+	ActionNone      NextAction = "NONE"
 )
 
 // ToolCall identifies one tool_use block: a pending call the worker hasn't
@@ -45,6 +49,21 @@ type ToolCall struct {
 	ToolUseID string
 	ToolName  string
 	ToolArgs  json.RawMessage
+
+	// The fields below are set only on RunState.InFlightTool, copied from
+	// the journaled ToolInvoked, so recovery never recomputes them from the
+	// current code or registry (Phase 3 FR-3, D-3).
+	HasSideEffect  bool
+	IdempotencyKey *string
+	// InvokedAt is the ToolInvoked envelope's occurred_at.
+	InvokedAt time.Time
+}
+
+// invocation is what the fold remembers about a journaled ToolInvoked.
+type invocation struct {
+	hasSideEffect  bool
+	idempotencyKey *string
+	invokedAt      time.Time
 }
 
 // stepRecord holds everything the fold has journaled for one LLMResponded
@@ -57,6 +76,11 @@ type stepRecord struct {
 	content []anthropic.ContentBlockUnion
 	// isTerminal mirrors this step's LLMResponded.IsTerminal.
 	isTerminal bool
+	// stopReason mirrors this step's LLMResponded.StopReason, needed to tell
+	// a truncated response from a completed one when finishing the run.
+	stopReason string
+	// invoked holds what each ToolInvoked journaled, keyed by tool_use_id.
+	invoked map[string]invocation
 	// order lists the tool_use_ids in content, in content order. Empty
 	// means this step's response had no tool_use blocks at all.
 	order []string
@@ -157,8 +181,17 @@ func cloneStepRecord(s stepRecord) stepRecord {
 	next := stepRecord{
 		content:      cloneContentBlocks(s.content),
 		isTerminal:   s.isTerminal,
+		stopReason:   s.stopReason,
 		order:        append([]string(nil), s.order...),
 		invokedOrder: append([]string(nil), s.invokedOrder...),
+	}
+	next.invoked = make(map[string]invocation, len(s.invoked))
+	for k, v := range s.invoked {
+		if v.idempotencyKey != nil {
+			key := *v.idempotencyKey
+			v.idempotencyKey = &key
+		}
+		next.invoked[k] = v
 	}
 	next.results = make(map[string]events.ToolResultedPayload, len(s.results))
 	for k, v := range s.results {
@@ -170,6 +203,10 @@ func cloneStepRecord(s stepRecord) stepRecord {
 // cloneToolCall copies tc, including a fresh backing array for ToolArgs.
 func cloneToolCall(tc ToolCall) ToolCall {
 	tc.ToolArgs = append(json.RawMessage(nil), tc.ToolArgs...)
+	if tc.IdempotencyKey != nil {
+		key := *tc.IdempotencyKey
+		tc.IdempotencyKey = &key
+	}
 	return tc
 }
 

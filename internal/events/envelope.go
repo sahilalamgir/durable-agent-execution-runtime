@@ -23,7 +23,7 @@ type Envelope struct {
 	EventType      EventType       `json:"event_type"`
 	Payload        json.RawMessage `json:"payload"`
 	OccurredAt     time.Time       `json:"occurred_at"`     // UTC, truncated to µs
-	IdempotencyKey *string         `json:"idempotency_key"` // always null in Phase 2
+	IdempotencyKey *string         `json:"idempotency_key"` // non-null only on a side-effecting ToolInvoked (Phase 3)
 }
 
 // NewEnvelope builds an Envelope around p: it assigns a fresh event_id,

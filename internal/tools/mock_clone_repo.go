@@ -43,7 +43,7 @@ type cloneRepoArgs struct {
 	RepoURL string `json:"repo_url"`
 }
 
-func (t *CloneRepoTool) Execute(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+func (t *CloneRepoTool) Execute(ctx context.Context, _ Invocation, rawArgs json.RawMessage) (string, error) {
 	if err := mockToolDelay(ctx); err != nil {
 		return "", fmt.Errorf("waiting out mock delay: %w", err)
 	}

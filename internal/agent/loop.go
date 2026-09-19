@@ -8,12 +8,12 @@ import (
 	"io"
 	"net"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 
 	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/events"
+	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/idempotency"
 	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/kafka"
 	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/replay"
 	"github.com/sahilalamgir/durable-agent-execution-runtime/internal/tools"
@@ -69,6 +69,12 @@ func NewJournalConfig(publisher kafka.EventPublisher, runID, tenantID, workloadT
 	}
 }
 
+// Fence runs a side-effecting tool under the idempotency fence. It is
+// implemented by *idempotency.Guard; the interface lets tests substitute it.
+type Fence interface {
+	Run(ctx context.Context, inv tools.Invocation, call replay.ToolCall, tool tools.Tool) (idempotency.Outcome, error)
+}
+
 // Loop runs a single agent task to completion by journaling every step
 // through Kafka before acting on it (FR-8): it publishes an event, applies
 // it to a replay.RunState, and asks that RunState for the conversation
@@ -82,6 +88,7 @@ type Loop struct {
 	maxSteps  int
 	out       io.Writer
 	journal   JournalConfig
+	fence     Fence
 }
 
 // NewLoop constructs a Loop. maxSteps bounds the number of LLM round-trips
@@ -90,11 +97,9 @@ type Loop struct {
 // otherwise, since an invalid maxSteps is a construction-time configuration
 // error, not a runtime condition.
 //
-// registry's tool instances are stateful for the lifetime of this Loop (see
-// Registry's doc comment): build a fresh Registry, via NewRegistry with
-// fresh tool constructors, for each independent Run call if any tool
-// carries state across invocations.
-func NewLoop(llm LLMClient, registry *tools.Registry, model anthropic.Model, maxTokens int64, maxSteps int, out io.Writer, journal JournalConfig) *Loop {
+// fence guards every side-effecting tool. A Loop with a nil fence never
+// executes a side-effecting tool (it fails closed with an error).
+func NewLoop(llm LLMClient, registry *tools.Registry, model anthropic.Model, maxTokens int64, maxSteps int, out io.Writer, journal JournalConfig, fence Fence) *Loop {
 	if maxSteps <= 0 {
 		panic("agent: maxSteps must be positive")
 	}
@@ -106,21 +111,19 @@ func NewLoop(llm LLMClient, registry *tools.Registry, model anthropic.Model, max
 		maxSteps:  maxSteps,
 		out:       out,
 		journal:   journal,
+		fence:     fence,
 	}
 }
 
-// Run executes task to completion, or until maxSteps is exceeded. It never
-// panics: an unknown tool name or malformed tool arguments become an
-// is_error tool_result fed back to the model (FR-9, EC-16), and exceeding
-// maxSteps is a normal (non-error) Outcome. Run returns a non-nil error
-// when the LLM call itself fails in a way that can't be journaled (a nil
-// response with no error), or when journaling a step fails (ErrPublishFailed
-// after retries, or a replay.Apply invariant violation, which should never
-// happen against Loop's own well-formed envelopes).
-//
-// Every action Run takes — the LLM call, a tool's Execute — is driven
-// purely by the folded RunState's NextAction (D-1): there is no separate
-// step counter or messages slice threaded through this method.
+// Run starts a fresh run for task: it journals RunStarted and then drives
+// the run to a terminal state. It never panics: an unknown tool name or
+// malformed tool arguments become an is_error tool_result fed back to the
+// model (FR-9, EC-16), and exceeding maxSteps is a normal (non-error)
+// Outcome. Run returns a non-nil error when the LLM call itself fails, when
+// journaling fails (ErrPublishFailed after retries), or when the fence
+// cannot vouch for a side-effecting tool (idempotency.ErrFenceUnavailable /
+// ErrOutcomeUnknown — no terminal event is journaled, so the run stays
+// resumable).
 func (l *Loop) Run(ctx context.Context, task Task) (Outcome, error) {
 	inputJSON, err := json.Marshal(struct {
 		Prompt string `json:"prompt"`
@@ -137,52 +140,54 @@ func (l *Loop) Run(ctx context.Context, task Task) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
+	return l.drive(ctx, state)
+}
 
+// Resume continues a run from state, which the caller obtained by replaying
+// the run's events from Kafka. It publishes from state.NextSequence.
+func (l *Loop) Resume(ctx context.Context, state replay.RunState) (Outcome, error) {
+	return l.drive(ctx, state)
+}
+
+// drive is the one loop that handles every NextAction (FR-23), for a fresh
+// run and a resumed one alike: everything it does is decided by the folded
+// RunState (D-1), with no separate step counter or messages slice.
+func (l *Loop) drive(ctx context.Context, state replay.RunState) (Outcome, error) {
 	for {
+		var (
+			done *Outcome
+			err  error
+		)
 		switch state.NextAction {
 		case replay.ActionCallLLM:
-			var outcome Outcome
-			var done bool
-			state, outcome, done, err = l.callLLMAndJournal(ctx, state)
-			if err != nil {
-				return Outcome{}, err
-			}
-			if done {
-				return outcome, nil
-			}
-
+			state, err = l.callLLMAndJournal(ctx, state)
 		case replay.ActionExecuteTool:
-			state, err = l.executeNextToolAndJournal(ctx, state)
-			if err != nil {
-				return Outcome{}, err
-			}
-
+			state, done, err = l.invokeToolAndJournal(ctx, state)
+		case replay.ActionResolveInFlightTool:
+			state, done, err = l.runInFlightTool(ctx, state)
+		case replay.ActionFinishRun:
+			return l.finishRun(ctx, state)
 		case replay.ActionFailMaxSteps:
-			state, err = l.publishApplyPrint(ctx, state, events.RunFailedPayload{
-				Step:         state.CurrentStep,
-				ErrorClass:   "max_steps_exceeded",
-				ErrorMessage: fmt.Sprintf("exceeded max_steps=%d without reaching a terminal state", l.maxSteps),
-				Retryable:    false,
-			})
-			if err != nil {
-				return Outcome{}, err
-			}
-			return Outcome{MaxStepsExceeded: true, Failed: true, Steps: state.CurrentStep}, nil
-
+			return l.failMaxSteps(ctx, state)
 		default:
-			return Outcome{}, fmt.Errorf("run: state produced unexpected next_action=%s for a live run", state.NextAction)
+			return Outcome{}, fmt.Errorf("run: state produced unexpected next_action=%s", state.NextAction)
+		}
+		if err != nil {
+			return Outcome{}, err
+		}
+		if done != nil {
+			return *done, nil
 		}
 	}
 }
 
-// callLLMAndJournal makes the next LLM call, journals its LLMResponded
-// event, and — if that response is terminal (stop_reason != tool_use) —
-// journals the matching terminal event per FR-10 and reports done=true.
-// Otherwise it reports done=false so Run's loop continues.
-func (l *Loop) callLLMAndJournal(ctx context.Context, state replay.RunState) (replay.RunState, Outcome, bool, error) {
+// callLLMAndJournal makes the next LLM call and journals its LLMResponded
+// event. A terminal response leaves NextAction at FINISH_RUN; drive then
+// journals the matching terminal event via RunState.TerminalPayload.
+func (l *Loop) callLLMAndJournal(ctx context.Context, state replay.RunState) (replay.RunState, error) {
 	messages, err := state.Messages()
 	if err != nil {
-		return state, Outcome{}, false, fmt.Errorf("computing messages from state: %w", err)
+		return state, fmt.Errorf("computing messages from state: %w", err)
 	}
 
 	resp, callErr := l.llm.CreateMessage(ctx, anthropic.MessageNewParams{
@@ -204,113 +209,194 @@ func (l *Loop) callLLMAndJournal(ctx context.Context, state replay.RunState) (re
 			ErrorMessage: callErr.Error(),
 			Retryable:    isRetryableLLMError(callErr),
 		}); err != nil {
-			return state, Outcome{}, false, err
+			return state, err
 		}
-		return state, Outcome{}, false, fmt.Errorf("step %d: calling llm: %w", state.CurrentStep+1, callErr)
+		return state, fmt.Errorf("step %d: calling llm: %w", state.CurrentStep+1, callErr)
 	}
 	if resp == nil {
-		return state, Outcome{}, false, fmt.Errorf("step %d: llm returned a nil response with no error", state.CurrentStep+1)
+		return state, fmt.Errorf("step %d: llm returned a nil response with no error", state.CurrentStep+1)
 	}
 
 	contentJSON, err := marshalContentVerbatim(resp.Content)
 	if err != nil {
-		return state, Outcome{}, false, fmt.Errorf("marshaling llm response content: %w", err)
+		return state, fmt.Errorf("marshaling llm response content: %w", err)
 	}
-	isTerminal := resp.StopReason != anthropic.StopReasonToolUse
-
-	next, err := l.publishApplyPrint(ctx, state, events.LLMRespondedPayload{
+	return l.publishApplyPrint(ctx, state, events.LLMRespondedPayload{
 		Step:       state.CurrentStep + 1,
 		StopReason: string(resp.StopReason),
 		Content:    contentJSON,
-		IsTerminal: isTerminal,
+		IsTerminal: resp.StopReason != anthropic.StopReasonToolUse,
 	})
-	if err != nil {
-		return state, Outcome{}, false, err
-	}
-
-	if !isTerminal {
-		if len(next.PendingToolCalls) == 0 && next.InFlightTool == nil {
-			// FR-10: stop_reason == tool_use but the response had no
-			// tool_use content block at all.
-			final, err := l.publishApplyPrint(ctx, next, events.RunFailedPayload{
-				Step:         next.CurrentStep,
-				ErrorClass:   "malformed_llm_response",
-				ErrorMessage: "llm reported stop_reason=tool_use but the response had no tool_use content block",
-				Retryable:    false,
-			})
-			if err != nil {
-				return next, Outcome{}, false, err
-			}
-			return final, Outcome{Failed: true, Steps: final.CurrentStep}, true, nil
-		}
-		return next, Outcome{}, false, nil
-	}
-
-	if resp.StopReason == anthropic.StopReasonMaxTokens {
-		final, err := l.publishApplyPrint(ctx, next, events.RunFailedPayload{
-			Step:         next.CurrentStep,
-			ErrorClass:   "llm_output_truncated",
-			ErrorMessage: "llm response was truncated (stop_reason=max_tokens)",
-			Retryable:    false,
-		})
-		if err != nil {
-			return next, Outcome{}, false, err
-		}
-		return final, Outcome{Truncated: true, Failed: true, Steps: final.CurrentStep, FinalText: extractText(resp)}, true, nil
-	}
-
-	final, err := l.publishApplyPrint(ctx, next, events.RunCompletedPayload{
-		FinalOutput: extractText(resp),
-		TotalSteps:  next.CurrentStep,
-	})
-	if err != nil {
-		return next, Outcome{}, false, err
-	}
-	return final, Outcome{Terminal: true, Steps: final.CurrentStep, FinalText: extractText(resp)}, true, nil
 }
 
-// executeNextToolAndJournal journals and executes exactly one tool call:
-// state.PendingToolCalls[0], the next unstarted tool_use block in the
-// current step's content order (FR-15). It always journals a ToolInvoked
-// before calling Execute (FR-8), and always journals a matching
-// ToolResulted afterward — with status "error" for an unknown tool name or
-// a failed Execute call (FR-9, EC-16) — so every tool_use_id gets exactly
-// one result.
-func (l *Loop) executeNextToolAndJournal(ctx context.Context, state replay.RunState) (replay.RunState, error) {
+// finishRun journals the terminal event for a run whose last LLMResponded
+// needs no more tools (FR-10). Live and resumed finishes both come through
+// here, using RunState.TerminalPayload, so they cannot drift apart.
+func (l *Loop) finishRun(ctx context.Context, state replay.RunState) (Outcome, error) {
+	payload, err := state.TerminalPayload()
+	if err != nil {
+		return Outcome{}, fmt.Errorf("finishing run: %w", err)
+	}
+	final, err := l.publishApplyPrint(ctx, state, payload)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	outcome := Outcome{Steps: final.CurrentStep}
+	switch p := payload.(type) {
+	case events.RunCompletedPayload:
+		outcome.Terminal = true
+		outcome.FinalText = p.FinalOutput
+	case events.RunFailedPayload:
+		outcome.Failed = true
+		if p.ErrorClass == "llm_output_truncated" {
+			outcome.Truncated = true
+			outcome.FinalText = state.LastStepText()
+		}
+	}
+	return outcome, nil
+}
+
+func (l *Loop) failMaxSteps(ctx context.Context, state replay.RunState) (Outcome, error) {
+	final, err := l.publishApplyPrint(ctx, state, events.RunFailedPayload{
+		Step:         state.CurrentStep,
+		ErrorClass:   "max_steps_exceeded",
+		ErrorMessage: fmt.Sprintf("exceeded max_steps=%d without reaching a terminal state", state.MaxSteps),
+		Retryable:    false,
+	})
+	if err != nil {
+		return Outcome{}, err
+	}
+	return Outcome{MaxStepsExceeded: true, Failed: true, Steps: final.CurrentStep}, nil
+}
+
+// failRun journals RunFailed for an unrecoverable tool-path problem and
+// reports the run as failed.
+func (l *Loop) failRun(ctx context.Context, state replay.RunState, errorClass, message string) (replay.RunState, *Outcome, error) {
+	final, err := l.publishApplyPrint(ctx, state, events.RunFailedPayload{
+		Step:         state.CurrentStep,
+		ErrorClass:   errorClass,
+		ErrorMessage: message,
+		Retryable:    false,
+	})
+	if err != nil {
+		return state, nil, err
+	}
+	return final, &Outcome{Failed: true, Steps: final.CurrentStep}, nil
+}
+
+// invokeToolAndJournal handles a tool call that has no ToolInvoked yet
+// (state.PendingToolCalls[0], the next unstarted tool_use block in content
+// order, FR-15). It computes the idempotency key exactly once, here, for a
+// side-effecting tool (FR-3), journals ToolInvoked and waits for the ack,
+// and only then hands off to runInFlightTool — the same path a resumed run
+// takes (D-3).
+func (l *Loop) invokeToolAndJournal(ctx context.Context, state replay.RunState) (replay.RunState, *Outcome, error) {
 	call := state.PendingToolCalls[0]
 	tool, found := l.registry.Lookup(call.ToolName)
 
 	hasSideEffect := found && tool.HasSideEffect()
+	var key *string
+	if hasSideEffect {
+		k := idempotency.Key(l.journal.RunID, state.CurrentStep, call.ToolUseID)
+		key = &k
+	}
 	state, err := l.publishApplyPrint(ctx, state, events.ToolInvokedPayload{
-		Step:          state.CurrentStep,
-		ToolUseID:     call.ToolUseID,
-		ToolName:      call.ToolName,
-		ToolArgs:      call.ToolArgs,
-		HasSideEffect: hasSideEffect,
+		Step:           state.CurrentStep,
+		ToolUseID:      call.ToolUseID,
+		ToolName:       call.ToolName,
+		ToolArgs:       call.ToolArgs,
+		IdempotencyKey: key,
+		HasSideEffect:  hasSideEffect,
 	})
 	if err != nil {
-		return state, err
+		return state, nil, err
+	}
+	return l.runInFlightTool(ctx, state)
+}
+
+// runInFlightTool executes state.InFlightTool, whose ToolInvoked is already
+// journaled, and journals its ToolResulted. It trusts the journaled
+// has_side_effect and idempotency_key, never the current registry or key
+// code (FR-3): a redeploy between crash and resume must not change what
+// counts as a side effect. A tool that only reads is simply re-executed
+// (FR-22); a side-effecting one always goes through the fence.
+func (l *Loop) runInFlightTool(ctx context.Context, state replay.RunState) (replay.RunState, *Outcome, error) {
+	call := *state.InFlightTool
+	tool, found := l.registry.Lookup(call.ToolName)
+	inv := tools.Invocation{
+		RunID:          l.journal.RunID,
+		Step:           state.CurrentStep,
+		ToolUseID:      call.ToolUseID,
+		IdempotencyKey: call.IdempotencyKey,
 	}
 
+	if !call.HasSideEffect {
+		return l.executeUnfenced(ctx, state, call, inv, tool, found)
+	}
+	switch {
+	case !found:
+		return l.failRun(ctx, state, "unresolved_side_effect", fmt.Sprintf(
+			"tool %q (tool_use_id=%s) was journaled with has_side_effect=true but is not registered, so whether it ran cannot be checked",
+			call.ToolName, call.ToolUseID))
+	case call.IdempotencyKey == nil:
+		return l.failRun(ctx, state, "unresolved_side_effect", fmt.Sprintf(
+			"tool %q (tool_use_id=%s) has a side effect but its ToolInvoked has no idempotency key, so whether it ran cannot be checked",
+			call.ToolName, call.ToolUseID))
+	case l.fence == nil:
+		return state, nil, fmt.Errorf("running side-effecting tool %q: no idempotency fence configured", call.ToolName)
+	}
+	return l.executeFenced(ctx, state, call, inv, tool)
+}
+
+// executeUnfenced runs a tool with no side effect. An unknown tool name or a
+// failed Execute becomes status "error" (FR-9, EC-16), so every tool_use_id
+// gets exactly one result.
+func (l *Loop) executeUnfenced(ctx context.Context, state replay.RunState, call replay.ToolCall, inv tools.Invocation, tool tools.Tool, found bool) (replay.RunState, *Outcome, error) {
 	var result, status string
 	if !found {
 		result = fmt.Sprintf("error: unknown tool %q", call.ToolName)
 		status = "error"
-	} else if r, execErr := tool.Execute(ctx, call.ToolArgs); execErr != nil {
+	} else if r, execErr := tool.Execute(ctx, inv, call.ToolArgs); execErr != nil {
 		result = fmt.Sprintf("error: %v", execErr)
 		status = "error"
 	} else {
 		result = r
 		status = "success"
 	}
-
-	return l.publishApplyPrint(ctx, state, events.ToolResultedPayload{
-		Step:      state.CurrentStep,
-		ToolUseID: call.ToolUseID,
-		ToolName:  call.ToolName,
-		Result:    result,
-		Status:    status,
+	return l.journalToolResult(ctx, state, call, idempotency.Outcome{
+		Result: result, Status: status, Resolution: idempotency.ResolutionExecuted,
 	})
+}
+
+// executeFenced runs a side-effecting tool through the Guard and maps its
+// verdict: an unresolvable or mismatched record fails the run; a fence that
+// can't be consulted, or an unknown outcome, returns an error with NO
+// terminal event so the run stays resumable (FR-8, FR-12).
+func (l *Loop) executeFenced(ctx context.Context, state replay.RunState, call replay.ToolCall, inv tools.Invocation, tool tools.Tool) (replay.RunState, *Outcome, error) {
+	outcome, err := l.fence.Run(ctx, inv, call, tool)
+	switch {
+	case errors.Is(err, idempotency.ErrUnresolvable):
+		return l.failRun(ctx, state, "unresolved_side_effect", err.Error())
+	case errors.Is(err, idempotency.ErrRecordMismatch):
+		return l.failRun(ctx, state, "idempotency_record_mismatch", err.Error())
+	case err != nil:
+		return state, nil, fmt.Errorf("running side-effecting tool %q: %w", call.ToolName, err)
+	}
+	return l.journalToolResult(ctx, state, call, outcome)
+}
+
+func (l *Loop) journalToolResult(ctx context.Context, state replay.RunState, call replay.ToolCall, o idempotency.Outcome) (replay.RunState, *Outcome, error) {
+	next, err := l.publishApplyPrint(ctx, state, events.ToolResultedPayload{
+		Step:                 state.CurrentStep,
+		ToolUseID:            call.ToolUseID,
+		ToolName:             call.ToolName,
+		Result:               o.Result,
+		Status:               o.Status,
+		WasReplayedFromCache: o.Resolution == idempotency.ResolutionCached,
+		Resolution:           string(o.Resolution),
+	})
+	return next, nil, err
 }
 
 // publishApplyPrint is the one chokepoint every journaled step in Loop goes
@@ -328,6 +414,12 @@ func (l *Loop) publishApplyPrint(ctx context.Context, state replay.RunState, pay
 	env, err := events.NewEnvelope(l.journal.RunID, l.journal.TenantID, state.NextSequence, payload, time.Now())
 	if err != nil {
 		return state, fmt.Errorf("building envelope for %s: %w", payload.EventType(), err)
+	}
+
+	// The envelope's idempotency_key mirrors the payload's, set here so the
+	// two can never diverge (FR-1). The projector writes it to Postgres.
+	if invoked, ok := payload.(events.ToolInvokedPayload); ok {
+		env.IdempotencyKey = invoked.IdempotencyKey
 	}
 
 	if err := l.publishWithRetry(ctx, env); err != nil {
@@ -428,17 +520,4 @@ func marshalContentVerbatim(content []anthropic.ContentBlockUnion) (json.RawMess
 		raw[i] = json.RawMessage(block.RawJSON())
 	}
 	return json.Marshal(raw)
-}
-
-// extractText walks resp's content blocks and joins every TextBlock's text,
-// in order. It is the model's accumulated final answer once StopReason is
-// no longer tool_use.
-func extractText(resp *anthropic.Message) string {
-	var parts []string
-	for _, block := range resp.Content {
-		if b, ok := block.AsAny().(anthropic.TextBlock); ok {
-			parts = append(parts, b.Text)
-		}
-	}
-	return strings.Join(parts, "")
 }
